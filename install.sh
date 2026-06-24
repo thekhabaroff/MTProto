@@ -217,7 +217,36 @@ fi
 separator "Installing dependencies"
 
 apt-get update -qq
-apt-get install -y -qq docker.io docker-compose-plugin curl jq openssl ufw xxd >/dev/null 2>&1
+apt-get install -y -qq curl jq openssl ufw xxd >/dev/null 2>&1
+
+# ── Docker (idempotent, repo-aware) ────────────────────────────────────────
+# Don't mix Ubuntu's docker.io with Docker's official docker-compose-plugin:
+# docker.io pulls Ubuntu's `containerd`, the official plugin pulls `containerd.io`,
+# and the two conflict ("pkgProblemResolver::Resolve ... broken packages").
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  info "Docker (with compose plugin) already installed — skipping"
+elif command -v docker >/dev/null 2>&1; then
+  info "Docker present but compose plugin missing — installing matching plugin"
+  if dpkg -s docker-ce >/dev/null 2>&1; then
+    apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1
+  else
+    apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
+      || apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1
+  fi
+else
+  info "Installing Docker from the official repository"
+  install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+  fi
+  . /etc/os-release
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
+fi
+
 systemctl enable --now docker
 
 # ── Generate or use imported secret ────────────────────────────────────────
