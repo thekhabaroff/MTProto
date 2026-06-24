@@ -29,11 +29,11 @@ telemt получает домен в ссылке через `[general.links] p
 
 ```bash
 # curl
-curl -fsSL https://raw.githubusercontent.com/thekhabaroff/MTProto/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/thekhabaroff/MTProto/master/install.sh -o install.sh
 sudo bash install.sh
 
 # либо wget
-wget -qO install.sh https://raw.githubusercontent.com/thekhabaroff/MTProto/main/install.sh
+wget -qO install.sh https://raw.githubusercontent.com/thekhabaroff/MTProto/master/install.sh
 sudo bash install.sh
 ```
 
