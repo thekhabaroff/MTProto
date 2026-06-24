@@ -705,10 +705,11 @@ separator "Installation complete!"
 
 SERVER_IP=$(curl -s4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
-# Build tg:// link. telemt's public_host makes the proxy advertise the DOMAIN,
-# so the link uses the domain (not the raw IP) — the FakeTLS secret encodes it.
+# Build the proxy links. telemt's public_host advertises the DOMAIN (not the raw
+# IP); the FakeTLS secret is ee + 32-hex secret + hex(domain).
 FAKE_TLS_SECRET="ee${TELEMT_SECRET}$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')"
 TG_LINK="tg://proxy?server=${DOMAIN}&port=${MTPROTO_PORT}&secret=${FAKE_TLS_SECRET}"
+TME_LINK="https://t.me/proxy?server=${DOMAIN}&port=${MTPROTO_PORT}&secret=${FAKE_TLS_SECRET}"
 
 if [[ "${MTPROTO_PORT}" == "443" ]]; then
   COVER_URL="https://${DOMAIN}/"
@@ -724,8 +725,20 @@ cat <<EOF
   Port:        ${MTPROTO_PORT}
   Secret:      ${TELEMT_SECRET}
 
-  Telegram link (uses the domain, not the IP):
+  Telegram link (FakeTLS, uses the domain — NOT the IP):
   ${TG_LINK}
+
+  Web form of the same link:
+  ${TME_LINK}
+
+  ! How to connect: open the link INSIDE Telegram — paste it into
+    "Saved Messages" and tap it, then choose "Connect". Opening a
+    t.me/proxy FakeTLS link in a plain web browser just bounces to
+    telegram.org (the t.me web page can't preview FakeTLS links);
+    that is normal and does NOT mean the proxy is broken.
+    Manual alternative: Settings → Data and Storage → Proxy →
+    Add proxy → MTProto, then server=${DOMAIN} port=${MTPROTO_PORT}
+    secret=${FAKE_TLS_SECRET}
 
   Cover-site:  ${COVER_URL}
 EOF
