@@ -1,0 +1,59 @@
+# Telemt Panel Configuration
+# Used by mtproto-installer when panel installation is selected
+
+# Address and port the panel listens on
+listen = "0.0.0.0:8080"
+
+# Base path for running behind a reverse proxy (e.g. "/panel123")
+# base_path = "/panel123"
+
+[telemt]
+# Telemt API base URL (no trailing slash)
+url = "http://127.0.0.1:9091"
+# Authorization header value sent to Telemt API
+# auth_header = "your-telemt-api-secret"
+# Path to telemt binary (default: /bin/telemt)
+# binary_path = "/bin/telemt"
+# Systemd service name (default: telemt)
+# service_name = "telemt"
+# GitHub repository for update checks (default: telemt/telemt)
+# github_repo = "telemt/telemt"
+# How the panel edits Telemt's config:
+#   "api"  (default) — via Telemt's HTTP API
+#   "file" — edits the raw file directly
+config_edit_mode = "api"
+
+[panel]
+# Path to telemt-panel binary (default: /usr/local/bin/telemt-panel)
+# binary_path = "/usr/local/bin/telemt-panel"
+# Systemd service name (default: telemt-panel)
+# service_name = "telemt-panel"
+# GitHub repository for update checks (default: amirotin/telemt_panel)
+# github_repo = "amirotin/telemt_panel"
+#
+# GitHub API token (optional, recommended to avoid rate limits)
+# github_token = "ghp_xxxxxxxxxxxxxxxxxxxx"
+
+[tls]
+# Option 1: Custom certificates
+# cert_file = "/path/to/cert.pem"
+# key_file = "/path/to/key.pem"
+
+# Option 2: Automatic Let's Encrypt (requires port 443 + port 80)
+# acme_domain = "panel.example.com"
+# acme_cache_dir = "/var/lib/telemt-panel/certs"
+
+[geoip]
+# Path to MaxMind GeoLite2 City database (.mmdb)
+# db_path = "/var/lib/telemt-panel/GeoLite2-City.mmdb"
+# asn_db_path = "/var/lib/telemt-panel/GeoLite2-ASN.mmdb"
+
+[auth]
+# Panel admin credentials
+username = "admin"
+# Generate with: telemt-panel hash-password
+password_hash = "$2a$10$CHANGE_ME"
+# Secret key for JWT signing (use a random string, min 32 chars)
+jwt_secret = "change-me-to-a-random-string-at-least-32-chars"
+# Session duration
+session_ttl = "24h"
