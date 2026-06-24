@@ -2,14 +2,21 @@
 # ============================================================================
 # MTProto Proxy (telemt backend) — automated installer v2
 #
-# Architecture:
-#   HAProxy :${MTPROTO_PORT} (SNI router, inspect-delay 30s for VPN compat)
-#     ├── MTProto SNI → telemt :13128 (FakeTLS + TLS-emulation, PROXY v2)
-#     └── everything else → Caddy :18443 (LE cert + HSTS + cover-site)
-#   HAProxy :80 → Caddy :18080 (ACME challenge only; port 80 closed at firewall
-#                               except during weekly renewal window)
-#   Watchtower → nightly auto-update of Caddy + HAProxy (telemt pinned by tag)
-#   Telemt Panel → web UI for proxy management (optional)
+# Architecture (single public port, no SNI router needed):
+#   telemt :${MTPROTO_PORT} (FakeTLS MTProto proxy; binds as root then drops to
+#       the unprivileged 'nonroot' user via --run-as-user)
+#     ├── MTProto clients  → proxied to Telegram
+#     └── everything else  → masked/relayed to Caddy :18443 (cover-site)
+#   Caddy :18443           cover-site (Let's Encrypt cert for the domain, HSTS)
+#   Caddy :<panel port>    reverse-proxy → Telemt Panel (same LE cert)  [optional]
+#   Caddy :80              ACME HTTP-01 challenge + redirect to HTTPS
+#   Watchtower → nightly auto-update of Caddy (telemt pinned by tag)
+#   Telemt Panel → web UI for proxy management (optional, behind Caddy TLS)
+#
+# Everything the user sees uses the DOMAIN, never the raw IP:
+#   * telemt's [general.links] public_host puts the domain in the tg:// link
+#   * telemt mirrors the cover-site's real LE cert for its FakeTLS handshake
+#   * the panel is published at https://<domain>:<panel port> with the LE cert
 #
 # telemt is a Rust+Tokio MTProxy implementation focused on DPI evasion:
 #   https://github.com/telemt/telemt
@@ -138,7 +145,7 @@ if [[ "$TELEMT_SECRET_MODE" == "import" ]]; then
   fi
 fi
 
-prompt_yn "Enable Watchtower (auto-update Caddy + HAProxy nightly)?" "y" ENABLE_WATCHTOWER
+prompt_yn "Enable Watchtower (auto-update Caddy nightly)?" "y" ENABLE_WATCHTOWER
 if [[ "$ENABLE_WATCHTOWER" == "yes" ]]; then
   prompt_default "Watchtower cron schedule" "0 0 4 * * *" WATCHTOWER_SCHEDULE
 else
@@ -152,14 +159,14 @@ else
   REBOOT_TIME=""
 fi
 
-prompt_default "Cert-renewal day-of-week (Mon..Sun) for systemd-timer that opens :80" "Sun" RENEWAL_DOW
-prompt_default "Cert-renewal time of day"                                              "04:00" RENEWAL_TIME
-
 # ── Telemt Panel (optional) ────────────────────────────────────────────────
 
 prompt_yn "Install Telemt Panel (web UI for proxy management)?" "y" INSTALL_PANEL
 if [[ "$INSTALL_PANEL" == "yes" ]]; then
   prompt_default "Panel listen port" "8080" PANEL_PORT
+  # The panel binds a localhost-only internal port; Caddy publishes it on
+  # PANEL_PORT with TLS. Keep this off the public ports above.
+  PANEL_INTERNAL_PORT="${PANEL_INTERNAL_PORT:-8181}"
   prompt_default "Panel admin username" "admin" PANEL_ADMIN_USER
   if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
     PANEL_ADMIN_PASS="${PANEL_ADMIN_PASS:-admin}"
@@ -196,7 +203,6 @@ cat <<EOF
   Secret mode:      ${TELEMT_SECRET_MODE}
   Watchtower:       ${ENABLE_WATCHTOWER}
   Unattended:       ${ENABLE_UNATTENDED}
-  Cert renewal:     ${RENEWAL_DOW} ${RENEWAL_TIME}
   Panel:            ${INSTALL_PANEL:-no}
 EOF
 
@@ -262,94 +268,106 @@ fi
 
 separator "Setting up directories"
 
-mkdir -p "${INSTALL_DIR}"/{caddy/{site,data,config},haproxy,telemt}
+mkdir -p "${INSTALL_DIR}"/{caddy/{site,data,config},telemt}
 info "Created ${INSTALL_DIR}"
 
 # ── Telemt config ──────────────────────────────────────────────────────────
 
 separator "Configuring telemt"
 
-cat > "${INSTALL_DIR}/telemt/telemt.toml" <<EOF
-[server]
-listen = "0.0.0.0:13128"
-proxy_protocol = "v2"
+# telemt reads /app/config.toml inside the image and runs as the unprivileged
+# 'nonroot' user (uid 65532) after binding the port. This is the upstream
+# 'telemt --init' schema with three deliberate additions:
+#   * [general.links] public_host → forces the DOMAIN (not the IP) into tg:// link
+#   * [censorship] mask_host/port → relays non-MTProto traffic to the local Caddy
+#                                   cover-site so browsers get a real LE cert
+#   * [server.api]                → local HTTP API consumed by Telemt Panel
+cat > "${INSTALL_DIR}/telemt/config.toml" <<EOF
+show_link = ["${TELEMT_USER}"]
 
-[tls]
-sni = "${DOMAIN}"
+[general]
+use_middle_proxy = false
+fast_mode = true
+log_level = "normal"
 
-[[users]]
-name = "${TELEMT_USER}"
-secret = "${TELEMT_SECRET}"
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+public_host = "${DOMAIN}"
+public_port = ${MTPROTO_PORT}
+
+[[server.listeners]]
+ip = "0.0.0.0"
+port = ${MTPROTO_PORT}
+
+[[server.listeners]]
+ip = "::"
+port = ${MTPROTO_PORT}
+
+[server.api]
+listen = "127.0.0.1:9091"
+whitelist = ["127.0.0.1/32", "::1/128"]
+
+[censorship]
+tls_domain = "${DOMAIN}"
+mask = true
+mask_host = "127.0.0.1"
+mask_port = 18443
+
+[access.users]
+${TELEMT_USER} = "${TELEMT_SECRET}"
 EOF
+
+# telemt drops to uid 65532 (nonroot) after binding the port; give it ownership
+# of its data dir so it can persist the proxy-secret / TLS-front / quota caches.
+chown -R 65532:65532 "${INSTALL_DIR}/telemt"
 
 info "telemt config written"
-
-# ── HAProxy config ─────────────────────────────────────────────────────────
-
-separator "Configuring HAProxy"
-
-cat > "${INSTALL_DIR}/haproxy/haproxy.cfg" <<EOF
-global
-    log stdout format raw local0
-    maxconn 4096
-
-defaults
-    log     global
-    mode    tcp
-    option  tcplog
-    timeout connect 10s
-    timeout client  300s
-    timeout server  300s
-
-frontend ft_ssl
-    bind *:${MTPROTO_PORT}
-    tcp-request inspect-delay 30s
-    tcp-request content accept if { req.ssl_hello_type 1 }
-
-    # MTProto traffic (SNI matches domain) → telemt
-    use_backend bk_mtproto if { req.ssl_sni -i ${DOMAIN} }
-    # Everything else → Caddy (cover-site with LE cert)
-    default_backend bk_caddy_https
-
-backend bk_mtproto
-    server telemt 127.0.0.1:13128 send-proxy-v2
-
-backend bk_caddy_https
-    server caddy 127.0.0.1:18443
-
-frontend ft_http
-    bind *:80
-    default_backend bk_caddy_http
-
-backend bk_caddy_http
-    server caddy 127.0.0.1:18080
-EOF
-
-info "HAProxy config written"
 
 # ── Caddy config ───────────────────────────────────────────────────────────
 
 separator "Configuring Caddy"
 
+# Caddy obtains a real Let's Encrypt cert for ${DOMAIN} via the HTTP-01 challenge
+# on port 80. TLS-ALPN is disabled because telemt — not Caddy — owns
+# :${MTPROTO_PORT}. The cover-site is served on :18443; telemt relays non-MTProto
+# visitors there, so browsers complete a real TLS handshake with Caddy and see a
+# valid certificate. Caddy auto-renews while port 80 stays open at the firewall.
 cat > "${INSTALL_DIR}/caddy/Caddyfile" <<EOF
 {
-    auto_https off
+    http_port 80
 }
 
-:18443 {
-    tls /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.crt \
-        /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}/${DOMAIN}.key
+https://${DOMAIN}:18443 {
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
     header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    encode gzip
     root * /srv
     file_server
 }
+EOF
 
-:18080 {
-    # ACME HTTP-01 challenge responder
-    # Caddy handles /.well-known/acme-challenge/* automatically
-    respond "OK" 200
+if [[ "${INSTALL_PANEL:-no}" == "yes" ]]; then
+  cat >> "${INSTALL_DIR}/caddy/Caddyfile" <<EOF
+
+https://${DOMAIN}:${PANEL_PORT} {
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
+    reverse_proxy 127.0.0.1:${PANEL_INTERNAL_PORT}
 }
 EOF
+fi
 
 # Cover-site HTML
 cat > "${INSTALL_DIR}/caddy/site/index.html" <<EOF
@@ -396,30 +414,7 @@ separator "Creating Docker Compose"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 
 cat > "$COMPOSE_FILE" <<EOF
-version: "3.8"
-
 services:
-  telemt:
-    image: ghcr.io/telemt/telemt:${TELEMT_IMAGE_TAG}
-    container_name: telemt
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ${INSTALL_DIR}/telemt/telemt.toml:/etc/telemt/telemt.toml:ro
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
-  haproxy:
-    image: haproxy:2.9-alpine
-    container_name: haproxy
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ${INSTALL_DIR}/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    depends_on:
-      - telemt
-      - caddy
-
   caddy:
     image: caddy:2-alpine
     container_name: caddy
@@ -430,6 +425,23 @@ services:
       - ${INSTALL_DIR}/caddy/site:/srv:ro
       - ${INSTALL_DIR}/caddy/data:/data
       - ${INSTALL_DIR}/caddy/config:/config
+
+  telemt:
+    image: ghcr.io/telemt/telemt:${TELEMT_IMAGE_TAG}
+    container_name: telemt
+    restart: unless-stopped
+    network_mode: host
+    # Start as root so telemt can bind the privileged port, then immediately drop
+    # to the unprivileged 'nonroot' user (uid 65532) via --run-as-user.
+    user: "0:0"
+    command: ["--data-path", "/data", "--run-as-user", "nonroot", "--run-as-group", "nonroot", "/app/config.toml"]
+    volumes:
+      - ${INSTALL_DIR}/telemt/config.toml:/app/config.toml:ro
+      - ${INSTALL_DIR}/telemt:/data
+    depends_on:
+      - caddy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
 EOF
 
 if [[ "$ENABLE_WATCHTOWER" == "yes" ]]; then
@@ -445,7 +457,7 @@ if [[ "$ENABLE_WATCHTOWER" == "yes" ]]; then
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_SCHEDULE=${WATCHTOWER_SCHEDULE}
       - WATCHTOWER_LABEL_ENABLE=false
-    command: --label-enable=false caddy haproxy
+    command: --label-enable=false caddy
 EOF
 fi
 
@@ -460,41 +472,15 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw allow ssh
 ufw allow "${MTPROTO_PORT}/tcp"
-# Port 80 is only opened during cert renewal
+# Port 80 stays open so Caddy can complete and auto-renew the Let's Encrypt
+# HTTP-01 challenge for ${DOMAIN} (and redirect plain-HTTP visitors to HTTPS).
+ufw allow 80/tcp
 ufw --force enable
-info "UFW configured (port ${MTPROTO_PORT} open, port 80 closed by default)"
-
-# ── Cert renewal timer ─────────────────────────────────────────────────────
-
-separator "Setting up cert renewal timer"
-
-cat > /etc/systemd/system/cert-renewal.service <<EOF
-[Unit]
-Description=Open port 80 for ACME renewal, run Caddy reload, close port 80
-
-[Service]
-Type=oneshot
-ExecStartPre=/usr/sbin/ufw allow 80/tcp
-ExecStart=/usr/bin/docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-ExecStartPost=/bin/sleep 120
-ExecStopPost=/usr/sbin/ufw delete allow 80/tcp
-EOF
-
-cat > /etc/systemd/system/cert-renewal.timer <<EOF
-[Unit]
-Description=Weekly cert renewal window
-
-[Timer]
-OnCalendar=${RENEWAL_DOW} ${RENEWAL_TIME}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable cert-renewal.timer
-info "Cert renewal timer: ${RENEWAL_DOW} ${RENEWAL_TIME}"
+info "UFW configured (open: ssh, ${MTPROTO_PORT}/tcp, 80/tcp)"
+if [[ "${INSTALL_PANEL:-no}" == "yes" ]]; then
+  ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1
+  info "Firewall: panel port ${PANEL_PORT} opened"
+fi
 
 # ── Unattended upgrades ────────────────────────────────────────────────────
 
@@ -629,7 +615,7 @@ if [[ "${INSTALL_PANEL:-no}" == "yes" ]]; then
 # Telemt Panel Configuration
 # Generated by MTProto installer on $(date -Iseconds)
 
-listen = "0.0.0.0:${PANEL_PORT}"
+listen = "127.0.0.1:${PANEL_INTERNAL_PORT}"
 
 [telemt]
 url = "${TELEMT_API_URL}"
@@ -708,11 +694,7 @@ EOF
   systemctl daemon-reload
   systemctl enable "$PANEL_BINARY_NAME"
   systemctl start "$PANEL_BINARY_NAME"
-  info "Panel service started and enabled"
-
-  # Open panel port in firewall
-  ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1
-  info "Firewall: port ${PANEL_PORT} opened for panel"
+  info "Panel service started (listening on 127.0.0.1:${PANEL_INTERNAL_PORT}, published by Caddy on :${PANEL_PORT})"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -723,44 +705,47 @@ separator "Installation complete!"
 
 SERVER_IP=$(curl -s4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
-# Build tg:// link
-FAKE_TLS_SECRET="ee${TELEMT_SECRET}$(echo -n "$DOMAIN" | xxd -p)"
-TG_LINK="tg://proxy?server=${SERVER_IP}&port=${MTPROTO_PORT}&secret=${FAKE_TLS_SECRET}"
+# Build tg:// link. telemt's public_host makes the proxy advertise the DOMAIN,
+# so the link uses the domain (not the raw IP) — the FakeTLS secret encodes it.
+FAKE_TLS_SECRET="ee${TELEMT_SECRET}$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')"
+TG_LINK="tg://proxy?server=${DOMAIN}&port=${MTPROTO_PORT}&secret=${FAKE_TLS_SECRET}"
+
+if [[ "${MTPROTO_PORT}" == "443" ]]; then
+  COVER_URL="https://${DOMAIN}/"
+else
+  COVER_URL="https://${DOMAIN}:${MTPROTO_PORT}/"
+fi
 
 cat <<EOF
 
-  ┌─────────────────────────────────────────────────────────┐
-  │              MTProto Proxy — Ready!                       │
-  ├─────────────────────────────────────────────────────────┤
-  │                                                          │
-  │  Server:    ${SERVER_IP}                                 │
-  │  Port:      ${MTPROTO_PORT}                             │
-  │  Domain:    ${DOMAIN}                                   │
-  │  Secret:    ${TELEMT_SECRET}                             │
-  │                                                          │
-  │  Telegram link:                                          │
-  │  ${TG_LINK}
-  │                                                          │
-  │  Cover-site: https://${DOMAIN}:${MTPROTO_PORT}/         │
-  │                                                          │
+  ────────────────────  MTProto Proxy — Ready!  ────────────
+  Server IP:   ${SERVER_IP}
+  Domain:      ${DOMAIN}
+  Port:        ${MTPROTO_PORT}
+  Secret:      ${TELEMT_SECRET}
+
+  Telegram link (uses the domain, not the IP):
+  ${TG_LINK}
+
+  Cover-site:  ${COVER_URL}
 EOF
 
 if [[ "${INSTALL_PANEL:-no}" == "yes" ]]; then
   cat <<EOF
-  │  ── Panel ──────────────────────────────────────────────│
-  │  URL:       http://${SERVER_IP}:${PANEL_PORT}           │
-  │  Username:  ${PANEL_ADMIN_USER}                         │
-  │  Password:  (as configured)                              │
-  │                                                          │
+
+  ── Panel ────────────────────────────────────────────────
+  URL:         https://${DOMAIN}:${PANEL_PORT}/
+  Username:    ${PANEL_ADMIN_USER}
+  Password:    (as configured)
 EOF
 fi
 
 cat <<EOF
-  │  ── Management ─────────────────────────────────────────│
-  │  cd ${INSTALL_DIR} && docker compose logs -f            │
-  │  docker compose restart                                  │
-  │                                                          │
-  └─────────────────────────────────────────────────────────┘
+
+  ── Management ───────────────────────────────────────────
+  cd ${INSTALL_DIR} && docker compose logs -f
+  cd ${INSTALL_DIR} && docker compose restart
+  ──────────────────────────────────────────────────────────
 
 EOF
 
