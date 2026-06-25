@@ -510,7 +510,13 @@ separator "Starting services"
 
 cd "${INSTALL_DIR}"
 docker compose pull
-docker compose up -d
+# --force-recreate is required: on a reinstall the compose service definition is
+# unchanged, so plain `up -d` would leave the old container running with its old
+# in-memory config (e.g. a previously-entered secret). telemt loads config.toml
+# once at start and a single-file bind mount pins the old inode when the file is
+# replaced, so the running container never sees the new secret/domain. Recreating
+# guarantees the freshly written config.toml is loaded.
+docker compose up -d --force-recreate --remove-orphans
 
 info "All containers started"
 
